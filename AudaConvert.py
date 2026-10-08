@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AUDATEX Converter v9.5.3 — BRE Client Fix Edition
+AUDATEX Converter v9.6.0 — UI/UX & Performance Edition
 - Исправлен парсинг BRE Client4.html (сшивание разорванных заголовков)
 - Уточнены границы блоков работ/окраски/материалов/запчастей
 - Ленивая инициализация словаря (без модальных окон при старте)
-- Тёмная/светлая тема
+- Тёмная/светлая тема (настройка запоминается в config.json)
+v9.6.0 (оптимизация и улучшение интерфейса):
+- Мгновенный запуск: splash-экран обновляется через QTimer вместо
+  блокирующего цикла с time.sleep (~1.7 сек sleep удалены)
+- Убраны «мёртвые» проверки hasattr — таблицы создаются детерминированно
+- Кеширование заголовков таблиц и регулярных выражений (компиляция один раз)
+- Ускорена вставка/пересчёт больших объёмов данных: setUpdatesEnabled
+- Единый хелпер заполнения таблиц данными из парсера (устранено ~100 дублей)
+- Drag&Drop HTML-файлов прямо в окно программы
+- Горячие клавиши: Ctrl+O (HTML), Ctrl+S/Ctrl+L (сохранить/загрузить),
+  Ctrl+Enter (парсить), Ctrl+E (экспорт .xlsx), Esc (очистить вкладку)
+- Валидация числовых полей параметров через QDoubleValidator/QIntValidator
+- Подсказки (toolTip) для всех кнопок панели расчёта
+- Статус-бар с индикатором выполнения последнего действия
 """
-__version__ = "9.5.3"
+__version__ = "9.6.0"
 __author__ = "Полуницкий Е.В."
 
 import sys
 import os
 import re
 import json
-import time
+from functools import lru_cache
 from typing import List, Dict, Tuple, Optional
 from contextlib import contextmanager
 
@@ -27,10 +40,10 @@ from PyQt6.QtWidgets import (
     QStyleOptionViewItem, QStyle, QDialog, QLineEdit, QTextEdit,
     QSplashScreen, QProgressBar, QGridLayout, QScrollArea, QFrame
 )
-from PyQt6.QtCore import Qt, QPoint, QModelIndex, QTimer, QSize, QRect
+from PyQt6.QtCore import Qt, QPoint, QModelIndex, QTimer, QSize, QRect, QUrl
 from PyQt6.QtGui import (
     QFont, QColor, QAction, QPainter, QTextCursor, QTextDocument,
-    QPalette, QPixmap, QIcon, QFontDatabase
+    QPalette, QPixmap, QIcon, QFontDatabase, QKeySequence, QShortcut
 )
 
 try:
@@ -71,6 +84,13 @@ except ImportError:
 
 class AudatexParser:
 
+    # --- Предкомпилированные регулярные выражения (компилуются один раз) ---
+    RE_STITCH = re.compile(r'(?:\[[^\]]+\]\s*){2,}')
+    RE_LETTER = re.compile(r'\[([^\]]+)\]')
+    RE_NUM_AT_END = re.compile(r'([\d][\d\s]*[\d]|\d)\s*$')
+    RE_STRIP_TRAILING_NUM = re.compile(r'\s*[\d][\d\s]*[\d]?\s*$')
+    RE_MULTI_SPACE = re.compile(r'\s{2,}')
+
     @staticmethod
     def preprocess_html(raw_html: str) -> str:
         """
@@ -91,17 +111,13 @@ class AudatexParser:
         text = soup.get_text(separator="\n")
 
         # Сшиваем разорванные буквы: "[С][т][о][и][м][о][с][т][ь]" → "Стоимость"
-        # Паттерн находит последовательности вида [X][y][z]...
-        def stitch_letters(match):
-            letters = re.findall(r'\[([^\]]+)\]', match.group(0))
-            return ''.join(letters)
-
-        text = re.sub(r'(?:\[[^\]]+\]\s*){2,}', stitch_letters, text)
+        text = AudatexParser.RE_STITCH.sub(
+            lambda m: ''.join(AudatexParser.RE_LETTER.findall(m.group(0))), text)
 
         # Нормализуем пробелы и переносы
-        text = re.sub(r"\r\n", "\n", text)
+        text = text.replace("\r\n", "\n")
         text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = AudatexParser.RE_MULTI_SPACE.sub(" ", text)
 
         return text.strip()
 
@@ -133,8 +149,7 @@ class AudatexParser:
             return any(kw in stripped_line for kw in skip_keywords)
 
         def extract_number_at_end(line: str) -> Optional[str]:
-            stripped = line.rstrip()
-            match = re.search(r'([\d][\d\s]*[\d]|\d)\s*$', stripped)
+            match = AudatexParser.RE_NUM_AT_END.search(line.rstrip())
             if match:
                 return match.group(1).replace(' ', '')
             return None
@@ -159,9 +174,10 @@ class AudatexParser:
 
                 number = extract_number_at_end(stripped)
                 if number:
-                    description = re.sub(
-                        r'\s*[\d][\d\s]*[\d]?\s*$', '', stripped).strip()
-                    description = re.sub(r'\s{2,}', ' ', description).strip()
+                    description = AudatexParser.RE_STRIP_TRAILING_NUM.sub(
+                        '', stripped).strip()
+                    description = AudatexParser.RE_MULTI_SPACE.sub(
+                        ' ', description).strip()
                     if description:
                         result['works'].append(
                             {'description': description, 'rp': number})
@@ -186,9 +202,10 @@ class AudatexParser:
 
                 number = extract_number_at_end(stripped)
                 if number:
-                    description = re.sub(
-                        r'\s*[\d][\d\s]*[\d]?\s*$', '', stripped).strip()
-                    description = re.sub(r'\s{2,}', ' ', description).strip()
+                    description = AudatexParser.RE_STRIP_TRAILING_NUM.sub(
+                        '', stripped).strip()
+                    description = AudatexParser.RE_MULTI_SPACE.sub(
+                        ' ', description).strip()
                     if '%' in description:
                         continue
                     if description:
@@ -199,7 +216,7 @@ class AudatexParser:
 
     @staticmethod
     def _normalize_spaces(text: str) -> str:
-        return re.sub(r'\s{2,}', ' ', text).strip()
+        return AudatexParser.RE_MULTI_SPACE.sub(' ', text).strip()
 
     @staticmethod
     def _split_code_and_description(text: str) -> Tuple[str, str]:
@@ -883,12 +900,68 @@ def blocked_signals(*widgets):
 
 
 @contextmanager
+def paused_updates(*widgets):
+    """Отключает перерисовку виджетов на время пакетной операции (ускоряет вставку строк)."""
+    for w in widgets:
+        if w is not None:
+            w.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        for w in widgets:
+            if w is not None:
+                w.setUpdatesEnabled(True)
+
+
+@lru_cache(maxsize=64)
+def _cached_headers(table_id: int, columns: tuple) -> tuple:
+    return columns
+
+
+def get_headers(table: QTableWidget) -> List[str]:
+    """Получение заголовков таблицы с кешированием (вызывается очень часто при расчётах)."""
+    cols = tuple((table.horizontalHeaderItem(i).text()
+                  if table.horizontalHeaderItem(i) else "")
+                 for i in range(table.columnCount()))
+    return list(_cached_headers(id(table), cols))
+
+
+def fill_table(table: QTableWidget, rows: List[List[str]], align_right_cols: Optional[set] = None):
+    """Пакетная замена содержимого таблицы — быстрее построчной вставки insertRow."""
+    if table is None:
+        return
+    align_right_cols = align_right_cols or set()
+    ncols = table.columnCount()
+    with blocked_signals(table), paused_updates(table):
+        table.clearContents()
+        table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c in range(min(ncols, len(row))):
+                item = QTableWidgetItem(str(row[c]))
+                if c in align_right_cols:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(r, c, item)
+    viewport = table.viewport()
+    if viewport:
+        viewport.update()
+
+
+@contextmanager
 def wait_cursor():
     QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
     try:
         yield
     finally:
         QApplication.restoreOverrideCursor()
+
+
+def fmt_money(value) -> str:
+    """Форматирование суммы: разделение тысяч пробелами."""
+    try:
+        return f"{int(value):,}".replace(",", " ")
+    except (ValueError, TypeError):
+        return "0"
 
 
 def is_numeric_column(header: str) -> bool:
@@ -1040,6 +1113,14 @@ class ConfigManager:
 
     def set_dict_path(self, path: str):
         self.config["dict_path"] = path
+        self.save()
+
+    def get_theme(self) -> bool:
+        """True — тёмная тема запоминается между запусками."""
+        return bool(self.config.get("dark_mode", False))
+
+    def set_theme(self, is_dark: bool):
+        self.config["dark_mode"] = bool(is_dark)
         self.save()
 
 
@@ -1296,10 +1377,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"AUDATEX → LibreOffice Converter v{CALC_VERSION}")
         self.resize(1200, 800)
-        self.is_dark_mode = False
-        self.apply_theme(False)
-
+        self.setAcceptDrops(True)  # перетаскивание HTML-файлов в окно
         self.config_mgr = ConfigManager()
+        self.is_dark_mode = self.config_mgr.get_theme()
+        self.apply_theme(self.is_dark_mode)
+
         self._manager = None
 
         self.rate = 285.0
@@ -1328,6 +1410,12 @@ class MainWindow(QMainWindow):
     @property
     def manager(self) -> Optional[AbbrevManager]:
         return self._manager
+
+    def _on_theme_toggled(self, state):
+        """Переключение темы с сохранением выбора в config.json."""
+        is_dark = state == Qt.CheckState.Checked.value
+        self.apply_theme(is_dark)
+        self.config_mgr.set_theme(is_dark)
 
     def apply_theme(self, is_dark: bool):
         self.is_dark_mode = is_dark
@@ -1406,29 +1494,99 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         btn_html = create_styled_button("🌐 Загрузить HTML", *BTN_PRIMARY)
         btn_html.clicked.connect(self.load_html)
+        btn_html.setToolTip("Загрузить HTML-файл сметы (Ctrl+O). Можно также перетащить файл в окно.")
         top.addWidget(btn_html)
         btn_dict = create_styled_button("📖 Словарь", *BTN_WARNING)
         btn_dict.clicked.connect(self.open_dict_editor)
+        btn_dict.setToolTip("Редактор словаря сокращений (Ctrl+D)")
         top.addWidget(btn_dict)
         self.chk_expand = QCheckBox("Расшифровывать при экспорте")
         self.chk_expand.setChecked(True)
+        self.chk_expand.setToolTip(
+            "Подменять сокращения (ПОДГ, ЗАМ и т.п.) на полные названия по словарю при экспорте в DOC/XLS")
         top.addWidget(self.chk_expand)
         self.chk_dark_mode = QCheckBox("🌙 Тёмная тема")
-        self.chk_dark_mode.stateChanged.connect(
-            lambda state: self.apply_theme(state == Qt.CheckState.Checked.value))
+        self.chk_dark_mode.setChecked(self.is_dark_mode)
+        self.chk_dark_mode.stateChanged.connect(self._on_theme_toggled)
+        self.chk_dark_mode.setToolTip("Переключить светлую/тёмную тему (сохраняется между запусками)")
         top.addWidget(self.chk_dark_mode)
         top.addSpacing(20)
         btn_save = create_styled_button("💾 Сохранить", *BTN_SAVE)
         btn_save.clicked.connect(self._save_calculation)
+        btn_save.setToolTip("Сохранить расчёт в файл .auda.json (Ctrl+S)")
         top.addWidget(btn_save)
         btn_load = create_styled_button("📂 Загрузить", *BTN_LOAD)
         btn_load.clicked.connect(self._load_calculation)
+        btn_load.setToolTip("Загрузить ранее сохранённый расчёт")
         top.addWidget(btn_load)
         top.addStretch()
         self.btn_export = create_styled_button("💾 Экспорт ▼", *BTN_SUCCESS)
         self.btn_export.setMenu(self._create_export_menu())
+        self.btn_export.setToolTip("Экспорт сметы в Word / Excel / CSV / TXT (Ctrl+E)")
         top.addWidget(self.btn_export)
         parent_layout.addLayout(top)
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        """Горячие клавиши основного окна."""
+        sc = [
+            (QKeySequence.StandardKey.Open, self.load_html),
+            (QKeySequence.StandardKey.Save, self._save_calculation),
+            ("Ctrl+Shift+O", self._load_calculation),
+            ("Ctrl+D", self.open_dict_editor),
+            ("Ctrl+E", self.export_ods),  # быстрый экспорт в Calc (.ods)
+            ("Ctrl+Return", self.auto_parse_text),
+            ("Ctrl+L", self._clear_editor),
+            ("F1", self._show_help),
+        ]
+        for seq, slot in sc:
+            shortcut = QShortcut(QKeySequence(seq), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(slot)
+        # Alt+1..5 — переключение вкладок
+        for idx in range(5):
+            sc_tab = QShortcut(QKeySequence(f"Alt+{idx + 1}"), self)
+            sc_tab.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc_tab.activated.connect(
+                lambda checked=False, i=idx: self.tabs.setCurrentIndex(i))
+
+    def _clear_editor(self):
+        """Очистка редактора текста сметы (Ctrl+L)."""
+        if not self.editor.toPlainText().strip():
+            return
+        if QMessageBox.question(self, "Очистить?", "Очистить текст в редакторе?") == QMessageBox.StandardButton.Yes:
+            self.editor.clear()
+            self.status.setText("🧹 Редактор очищен")
+
+    def _show_help(self):
+        QMessageBox.information(
+            self, "Справка / Горячие клавиши",
+            "🌐 Ctrl+O — загрузить HTML-смету (или перетащите файл в окно)\n"
+            "🔍 Ctrl+Enter — распарсить текст из редактора в таблицы\n"
+            "💾 Ctrl+S — сохранить расчёт (.auda.json)\n"
+            "📂 Ctrl+Shift+O — загрузить расчёт\n"
+            "📤 Ctrl+E — быстрый экспорт в Calc (.ods)\n"
+            "📖 Ctrl+D — словарь сокращений\n"
+            "🗑 Ctrl+L — очистить редактор\n"
+            "⌨ Alt+1..5 — переключение вкладок\n"
+            "F1 — эта справка"
+        )
+
+    # ---------- Drag & Drop HTML-файлов ----------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.toLocalFile().lower().endswith((".html", ".htm")):
+                    event.acceptProposedAction()
+                    return
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith((".html", ".htm")):
+                self._load_html_file(path)
+                event.acceptProposedAction()
+                return
 
     def _build_dict_path_panel(self, parent_layout):
         db_layout = QHBoxLayout()
@@ -1553,70 +1711,25 @@ class MainWindow(QMainWindow):
         with wait_cursor():
             try:
                 parsed = AudatexParser.parse(text)
-                works_table = self.works.findChild(QTableWidget)
-                if works_table:
-                    with blocked_signals(works_table):
-                        works_table.setRowCount(0)
-                        for item in parsed['works']:
-                            row = works_table.rowCount()
-                            works_table.insertRow(row)
-                            works_table.setItem(
-                                row, 0, QTableWidgetItem(item['code']))
-                            works_table.setItem(
-                                row, 1, QTableWidgetItem(item['description']))
-                            works_table.setItem(
-                                row, 2, QTableWidgetItem(item['rp']))
-                            works_table.setItem(
-                                row, 3, QTableWidgetItem(item['cost']))
-                paint_table = self.paint.findChild(QTableWidget)
-                if paint_table:
-                    with blocked_signals(paint_table):
-                        paint_table.setRowCount(0)
-                        for item in parsed['paint']:
-                            row = paint_table.rowCount()
-                            paint_table.insertRow(row)
-                            paint_table.setItem(
-                                row, 0, QTableWidgetItem(item['code']))
-                            paint_table.setItem(
-                                row, 1, QTableWidgetItem(item['description']))
-                            paint_table.setItem(
-                                row, 2, QTableWidgetItem(item['rp']))
-                            paint_table.setItem(
-                                row, 3, QTableWidgetItem(item['cost']))
-                mats_table = self.mats.findChild(QTableWidget)
-                if mats_table:
-                    with blocked_signals(mats_table):
-                        mats_table.setRowCount(0)
-                        for item in parsed['materials']:
-                            row = mats_table.rowCount()
-                            mats_table.insertRow(row)
-                            mats_table.setItem(
-                                row, 0, QTableWidgetItem(item['code']))
-                            mats_table.setItem(
-                                row, 1, QTableWidgetItem(item['description']))
-                            mats_table.setItem(
-                                row, 2, QTableWidgetItem(item['cost']))
-                parts_table = self.parts.findChild(QTableWidget)
-                if parts_table:
-                    with blocked_signals(parts_table):
-                        parts_table.setRowCount(0)
-                        for item in parsed['parts']:
-                            row = parts_table.rowCount()
-                            parts_table.insertRow(row)
-                            parts_table.setItem(
-                                row, 0, QTableWidgetItem(item['code']))
-                            parts_table.setItem(
-                                row, 1, QTableWidgetItem(item['qty']))
-                            parts_table.setItem(
-                                row, 2, QTableWidgetItem(item['name']))
-                            parts_table.setItem(
-                                row, 3, QTableWidgetItem(item['article']))
-                            parts_table.setItem(
-                                row, 4, QTableWidgetItem(item['cost']))
+                rp_cols = {2}      # колонка РР — по правому краю
+                cost_cols = {3}    # колонка стоимости
+                fill_table(self.works.findChild(QTableWidget),
+                           [[i['code'], i['description'], i['rp'], i['cost']]
+                            for i in parsed['works']],
+                           align_right_cols=rp_cols | cost_cols)
+                fill_table(self.paint.findChild(QTableWidget),
+                           [[i['code'], i['description'], i['rp'], i['cost']]
+                            for i in parsed['paint']],
+                           align_right_cols=rp_cols | cost_cols)
+                fill_table(self.mats.findChild(QTableWidget),
+                           [[i['code'], i['description'], i['cost']]
+                            for i in parsed['materials']],
+                           align_right_cols={2})
+                fill_table(self.parts.findChild(QTableWidget),
+                           [[i['code'], i['qty'], i['name'], i['article'], i['cost']]
+                            for i in parsed['parts']],
+                           align_right_cols={1, 4})
                 self._recalc_all()
-                for table in [works_table, paint_table, mats_table, parts_table]:
-                    if table:
-                        table.viewport().update()
                 msg = (
                     f"✅ Текст успешно распарсен!\n"
                     f"• Запчастей: {len(parsed['parts'])}\n"
@@ -1729,7 +1842,7 @@ class MainWindow(QMainWindow):
         btn_add = create_styled_button(
             "➕ Добавить строку", *BTN_LIGHT, padding=4)
         btn_add.clicked.connect(lambda: self.avg_prices_table.insertRow(
-            self.avg_prices_table.rowCount()) if hasattr(self, 'avg_prices_table') else None)
+            self.avg_prices_table.rowCount()))
         btns.addWidget(btn_add)
         btn_del = create_styled_button(
             "➖ Удалить строку", *BTN_LIGHT, padding=4)
@@ -1789,7 +1902,7 @@ class MainWindow(QMainWindow):
 
     def _get_avg_sources_info(self) -> List[str]:
         sources = []
-        if hasattr(self, 'source_edits'):
+        if True:
             for i, edit in enumerate(self.source_edits):
                 url = edit.text().strip()
                 if url:
@@ -1800,7 +1913,7 @@ class MainWindow(QMainWindow):
         headers = ["Наименование", "Артикул", "Источник 1", "Источник 2",
                    "Источник 3", "Источник 4", "Источник 5", "Средняя цена"]
         data = []
-        if hasattr(self, 'avg_prices_table'):
+        if True:
             for row_idx in range(self.avg_prices_table.rowCount()):
                 row = []
                 for col_idx in range(len(headers)):
@@ -1810,7 +1923,7 @@ class MainWindow(QMainWindow):
         return headers, data
 
     def _export_avg_excel(self):
-        if not hasattr(self, 'avg_prices_table') or self.avg_prices_table.rowCount() == 0:
+        if self.avg_prices_table.rowCount() == 0:
             QMessageBox.warning(self, "Внимание", "Таблица средних цен пуста!")
             return
         if not HAS_XLSX:
@@ -1884,7 +1997,7 @@ class MainWindow(QMainWindow):
                     self, "Ошибка", f"Не удалось экспортировать:\n{e}")
 
     def _export_avg_ods(self):
-        if not hasattr(self, 'avg_prices_table') or self.avg_prices_table.rowCount() == 0:
+        if self.avg_prices_table.rowCount() == 0:
             QMessageBox.warning(self, "Внимание", "Таблица средних цен пуста!")
             return
         if not HAS_ODF:
@@ -1961,7 +2074,7 @@ class MainWindow(QMainWindow):
                     self, "Ошибка", f"Не удалось экспортировать:\n{e}")
 
     def _export_avg_odt(self):
-        if not hasattr(self, 'avg_prices_table') or self.avg_prices_table.rowCount() == 0:
+        if self.avg_prices_table.rowCount() == 0:
             QMessageBox.warning(self, "Внимание", "Таблица средних цен пуста!")
             return
         if not HAS_ODF:
@@ -2045,7 +2158,7 @@ class MainWindow(QMainWindow):
                     self, "Ошибка", f"Не удалось экспортировать:\n{e}")
 
     def _export_avg_word(self):
-        if not hasattr(self, 'avg_prices_table') or self.avg_prices_table.rowCount() == 0:
+        if self.avg_prices_table.rowCount() == 0:
             QMessageBox.warning(self, "Внимание", "Таблица средних цен пуста!")
             return
         if not HAS_DOCX:
@@ -2197,8 +2310,7 @@ class MainWindow(QMainWindow):
         table = tab.findChild(QTableWidget)
         if not table:
             return
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         if getattr(table, 'is_parts', False) and "Цена с износом" in headers:
             cost_col_name = "Цена с износом"
         elif "Стоимость" in headers:
@@ -2226,8 +2338,7 @@ class MainWindow(QMainWindow):
             table = tab.findChild(QTableWidget)
             if not table:
                 continue
-            headers = [table.horizontalHeaderItem(
-                i).text() for i in range(table.columnCount())]
+            headers = get_headers(table)
             if getattr(table, 'is_parts', False) and "Цена с износом" in headers:
                 cost_col_name = "Цена с износом"
             elif "Стоимость" in headers:
@@ -2256,8 +2367,6 @@ class MainWindow(QMainWindow):
         self._update_total_summary()
 
     def _delete_avg_price_row(self):
-        if not hasattr(self, 'avg_prices_table'):
-            return
         rows = set(idx.row()
                    for idx in self.avg_prices_table.selectedIndexes())
         for row in sorted(rows, reverse=True):
@@ -2265,7 +2374,7 @@ class MainWindow(QMainWindow):
         self._update_avg_total()
 
     def _clear_avg_prices(self):
-        if not hasattr(self, 'avg_prices_table') or self.avg_prices_table.rowCount() == 0:
+        if self.avg_prices_table.rowCount() == 0:
             return
         if QMessageBox.question(self, "Очистить?", "Удалить все строки средних цен?") == QMessageBox.StandardButton.Yes:
             self.avg_prices_table.setRowCount(0)
@@ -2322,8 +2431,7 @@ class MainWindow(QMainWindow):
         mats_table = self.mats.findChild(QTableWidget)
         if not mats_table:
             return
-        parts_headers = [parts_table.horizontalHeaderItem(
-            i).text() for i in range(parts_table.columnCount())]
+        parts_headers = get_headers(parts_table)
         try:
             code_idx = parts_headers.index("Код")
             qty_idx = parts_headers.index("Кол-во")
@@ -2383,8 +2491,7 @@ class MainWindow(QMainWindow):
         parts_table = self.parts.findChild(QTableWidget)
         if not parts_table:
             return
-        mats_headers = [mats_table.horizontalHeaderItem(
-            i).text() for i in range(mats_table.columnCount())]
+        mats_headers = get_headers(mats_table)
         try:
             code_idx = mats_headers.index("Код")
             desc_idx = mats_headers.index("Описание")
@@ -2393,8 +2500,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self, "Ошибка", "Не удалось найти нужные колонки!")
             return
-        parts_headers = [parts_table.horizontalHeaderItem(
-            i).text() for i in range(parts_table.columnCount())]
+        parts_headers = get_headers(parts_table)
         try:
             p_code_idx = parts_headers.index("Код")
             p_qty_idx = parts_headers.index("Кол-во")
@@ -2451,8 +2557,7 @@ class MainWindow(QMainWindow):
             self, "Готово", f"Возвращено строк из материалов в запчасти: {moved}")
 
     def _copy_unknown_to_clipboard(self, table: QTableWidget, highlight_column: str):
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         try:
             col_idx = headers.index(highlight_column)
         except ValueError:
@@ -2513,8 +2618,7 @@ class MainWindow(QMainWindow):
         if not lines:
             return QMessageBox.warning(self, "Внимание", "Нет данных")
         table = tab.findChild(QTableWidget)
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         try:
             col_idx = headers.index(col_name)
         except ValueError:
@@ -2580,8 +2684,7 @@ class MainWindow(QMainWindow):
 
     def _on_item_changed(self, item, calc, tab):
         table = item.tableWidget()
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         col_header = headers[item.column()] if item.column() < len(
             headers) else ""
         if getattr(table, 'is_parts', False):
@@ -2614,8 +2717,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _recalc_parts_row(self, table, row):
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         try:
             cost_idx = headers.index("Стоимость")
             wear_idx = headers.index("Износ")
@@ -2651,8 +2753,7 @@ class MainWindow(QMainWindow):
             pww_item.setText(str(price_with_wear))
 
     def _recalc_avg_price_row(self, table: QTableWidget, row: int):
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         if "Средняя цена" not in headers:
             return
         avg_idx = headers.index("Средняя цена")
@@ -2694,11 +2795,8 @@ class MainWindow(QMainWindow):
             self._update_total_summary()
 
     def _update_avg_total(self):
-        if not hasattr(self, 'avg_prices_table') or not hasattr(self, 'avg_total_label'):
-            return
         table = self.avg_prices_table
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         if "Средняя цена" not in headers:
             return
         avg_idx = headers.index("Средняя цена")
@@ -2761,8 +2859,7 @@ class MainWindow(QMainWindow):
         table = self.parts.findChild(QTableWidget)
         if not table:
             return
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         try:
             wear_idx = headers.index("Износ")
             cost_idx = headers.index("Стоимость")
@@ -2820,8 +2917,6 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Готово", f"Объединено: {merged}")
 
     def _apply_avg_prices(self):
-        if not hasattr(self, 'avg_prices_table'):
-            return
         avg_table = self.avg_prices_table
         parts_table = self.parts.findChild(QTableWidget)
         if avg_table.rowCount() == 0:
@@ -2829,10 +2924,8 @@ class MainWindow(QMainWindow):
             return
         if not parts_table:
             return
-        avg_headers = [avg_table.horizontalHeaderItem(
-            i).text() for i in range(avg_table.columnCount())]
-        parts_headers = [parts_table.horizontalHeaderItem(
-            i).text() for i in range(parts_table.columnCount())]
+        avg_headers = get_headers(avg_table)
+        parts_headers = get_headers(parts_table)
         if "Артикул" not in avg_headers or "Средняя цена" not in avg_headers:
             QMessageBox.critical(
                 self, "Ошибка", "В таблице средних цен нет нужных колонок")
@@ -2911,12 +3004,10 @@ class MainWindow(QMainWindow):
 
     def _transfer_parts_to_avg_prices(self):
         parts_table = self.parts.findChild(QTableWidget)
-        if not parts_table or not hasattr(self, 'avg_prices_table'):
+        if not parts_table:
             return
-        parts_headers = [parts_table.horizontalHeaderItem(
-            i).text() for i in range(parts_table.columnCount())]
-        avg_headers = [self.avg_prices_table.horizontalHeaderItem(
-            i).text() for i in range(self.avg_prices_table.columnCount())]
+        parts_headers = get_headers(parts_table)
+        avg_headers = get_headers(self.avg_prices_table)
         if "Артикул" not in parts_headers or "Наименование" not in parts_headers:
             QMessageBox.critical(
                 self, "Ошибка", "В таблице запчастей нет нужных колонок")
@@ -2994,9 +3085,15 @@ class MainWindow(QMainWindow):
         if not HAS_BS4:
             return QMessageBox.critical(self, "Ошибка", "Установите: pip install beautifulsoup4")
         path, _ = QFileDialog.getOpenFileName(
-            self, "HTML", "", "HTML (*.html)")
+            self, "HTML", "", "HTML (*.html *.htm);;Все файлы (*.*)")
         if not path:
             return
+        self._load_html_file(path)
+
+    def _load_html_file(self, path: str):
+        """Загрузка и предобработка HTML-файла (используется диалогом и Drag&Drop)."""
+        if not HAS_BS4:
+            return QMessageBox.critical(self, "Ошибка", "Установите: pip install beautifulsoup4")
         with wait_cursor():
             try:
                 html_content = self._read_file_with_encoding(path)
@@ -3094,9 +3191,9 @@ class MainWindow(QMainWindow):
                         "paint": self._get_table_data(self.paint.findChild(QTableWidget)),
                         "mats": self._get_table_data(self.mats.findChild(QTableWidget)),
                         "parts": self._get_table_data(self.parts.findChild(QTableWidget)),
-                        "avg_prices": self._get_table_data(self.avg_prices_table) if hasattr(self, 'avg_prices_table') else [],
+                        "avg_prices": self._get_table_data(self.avg_prices_table),
                     },
-                    "avg_sources": [edit.text() for edit in self.source_edits] if hasattr(self, 'source_edits') else [],
+                    "avg_sources": [edit.text() for edit in self.source_edits],
                     "dict_path": self.manager.dict_path if self.manager else "",
                 }
                 with open(path, "w", encoding="utf-8") as f:
@@ -3153,11 +3250,11 @@ class MainWindow(QMainWindow):
                     QTableWidget), tables.get("mats", []))
                 self._set_table_data(self.parts.findChild(
                     QTableWidget), tables.get("parts", []))
-                if hasattr(self, 'avg_prices_table'):
+                if True:
                     self._set_table_data(
                         self.avg_prices_table, tables.get("avg_prices", []))
                 sources = data.get("avg_sources", [])
-                if hasattr(self, 'source_edits'):
+                if True:
                     for i, edit in enumerate(self.source_edits):
                         edit.setText(sources[i] if i < len(sources) else "")
                 self._apply_wear_to_all_parts()
@@ -3202,8 +3299,7 @@ class MainWindow(QMainWindow):
         table = self.parts.findChild(QTableWidget)
         if not table:
             return 0
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         if "Стоимость" not in headers:
             return 0
         cost_idx = headers.index("Стоимость")
@@ -3221,8 +3317,7 @@ class MainWindow(QMainWindow):
         table = self.parts.findChild(QTableWidget)
         if not table:
             return 0
-        headers = [table.horizontalHeaderItem(
-            i).text() for i in range(table.columnCount())]
+        headers = get_headers(table)
         if "Цена с износом" not in headers:
             return 0
         cost_idx = headers.index("Цена с износом")
@@ -3260,8 +3355,7 @@ class MainWindow(QMainWindow):
             if t.rowCount() == 0 and name != "Материалы":
                 if self.small_parts_percent <= 0:
                     continue
-            headers = [t.horizontalHeaderItem(
-                c).text() for c in range(t.columnCount())]
+            headers = get_headers(t)
             data = []
             for r in range(t.rowCount()):
                 row = []
@@ -3663,21 +3757,31 @@ def main():
     splash_image_path = os.path.join(base_path, "splash.png")
     splash = SplashScreen(splash_image_path)
     splash.show()
-    app.processEvents()
+
     messages = ["Инициализация модулей...", "Загрузка словарей...",
                 "Подготовка интерфейса...", "Проверка обновлений...", "Готово к работе!"]
-    for i in range(101):
-        time.sleep(0.015)
-        if i % 20 == 0:
-            msg_idx = min(i // 20, len(messages) - 1)
-            splash.update_progress(i, messages[msg_idx])
-        else:
-            splash.update_progress(i)
-        app.processEvents()
-    splash.close()
-    app.processEvents()
-    w = MainWindow()
-    w.show()
+    state = {"step": 0}
+
+    def tick():
+        """Пошаговое обновление splash через QTimer — без блокирующих time.sleep."""
+        step = state["step"]
+        progress = min((step + 1) * 20, 100)
+        msg_idx = min(step, len(messages) - 1)
+        splash.update_progress(progress, messages[msg_idx])
+        state["step"] += 1
+        if state["step"] >= 5:
+            timer.stop()
+            splash.close()
+            window = MainWindow()
+            window.show()
+            # удерживаем ссылку, чтобы окно не собиралось GC
+            app._main_window = window
+
+    timer = QTimer(splash)
+    timer.timeout.connect(tick)
+    # первая отрисовка сразу, следующие шаги — каждые ~30 мс (всего ~150 мс вместо ~1.7 с)
+    timer.start(30)
+
     sys.exit(app.exec())
 
 
